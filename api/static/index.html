@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio Match</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --plane: #f9f9f7;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --rule: #e1e0d9;
+    --path-a: #2a78d6;
+    --path-b: #eb6834;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface: #1a1a19; --plane: #0d0d0d; --ink: #fff;
+      --ink-2: #c3c2b7; --muted: #898781; --rule: #2c2c2a;
+      --path-a: #3987e5; --path-b: #d95926;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 16px; background: var(--plane); color: var(--ink);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; }
+  p.lede { color: var(--ink-2); margin: 0 0 24px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--rule);
+    border-radius: 10px; padding: 20px; margin-bottom: 18px;
+  }
+  label { display: block; font-weight: 600; margin-bottom: 8px; }
+  input[type=file] { width: 100%; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; margin-top: 16px; }
+  .field { flex: 1 1 140px; }
+  .field span { display: block; font-size: .8rem; color: var(--muted); margin-bottom: 4px; }
+  select, input[type=number] {
+    width: 100%; padding: 7px 9px; border: 1px solid var(--rule);
+    border-radius: 6px; background: var(--plane); color: var(--ink); font: inherit;
+  }
+  button {
+    margin-top: 18px; padding: 10px 18px; border: 0; border-radius: 6px;
+    background: var(--path-a); color: #fff; font: inherit; font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: default; }
+  h2 { font-size: 1rem; margin: 0 0 2px; display: flex; align-items: center; gap: 8px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .meta { color: var(--muted); font-size: .82rem; margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--rule); }
+  th { color: var(--muted); font-weight: 600; font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .status { color: var(--ink-2); }
+  .err { color: #d03b3b; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Audio Match</h1>
+  <p class="lede">Upload a clip. It is matched two ways against the same corpus:
+     pooled MFCC embeddings searched with pgvector, and Shazam-style landmark
+     hashes resolved by a time-offset vote.</p>
+
+  <form class="card" id="form">
+    <label for="file">Audio clip (wav, mp3, flac &mdash; a few seconds is enough)</label>
+    <input type="file" id="file" name="file" accept="audio/*" required>
+    <div class="row">
+      <div class="field">
+        <span>Paths to run</span>
+        <select id="which">
+          <option value="both">Both</option>
+          <option value="a">Path A &mdash; embeddings</option>
+          <option value="b">Path B &mdash; landmarks</option>
+        </select>
+      </div>
+      <div class="field">
+        <span>Results per path</span>
+        <input type="number" id="top" value="5" min="1" max="20">
+      </div>
+      <div class="field">
+        <span>hnsw.ef_search</span>
+        <input type="number" id="ef" value="40" min="4" max="500">
+      </div>
+    </div>
+    <button type="submit" id="go">Identify</button>
+  </form>
+
+  <p class="status" id="status" hidden></p>
+  <div id="results"></div>
+</main>
+
+<script>
+const form = document.getElementById('form');
+const statusEl = document.getElementById('status');
+const results = document.getElementById('results');
+const go = document.getElementById('go');
+
+function table(rows, cols) {
+  const head = cols.map(c => `<th>${c.label}</th>`).join('');
+  const body = rows.map(r => '<tr>' + cols.map(c =>
+    `<td class="${c.num ? 'num' : ''}">${c.get(r)}</td>`).join('') + '</tr>').join('');
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function section(title, colour, meta, html) {
+  return `<div class="card">
+    <h2><span class="swatch" style="background:${colour}"></span>${title}</h2>
+    <p class="meta">${meta}</p>${html}</div>`;
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const file = document.getElementById('file').files[0];
+  if (!file) return;
+
+  const data = new FormData();
+  data.append('file', file);
+  const params = new URLSearchParams({
+    top: document.getElementById('top').value,
+    ef_search: document.getElementById('ef').value,
+    which: document.getElementById('which').value,
+  });
+
+  go.disabled = true;
+  results.innerHTML = '';
+  statusEl.hidden = false;
+  statusEl.className = 'status';
+  statusEl.textContent = 'Decoding, extracting features and searching…';
+
+  try {
+    const res = await fetch('/query?' + params, { method: 'POST', body: data });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(detail.detail || res.statusText);
+    }
+    const out = await res.json();
+    statusEl.textContent = `${out.filename} — ${out.duration.toFixed(2)} s decoded`;
+
+    let html = '';
+    if (out.embedding) {
+      const e = out.embedding;
+      html += section('Path A — embeddings',
+        getComputedStyle(document.documentElement).getPropertyValue('--path-a'),
+        `${e.n_query_segments} query segment(s) &middot; extract ${e.extract_ms.toFixed(1)} ms &middot; search ${e.search_ms.toFixed(1)} ms`,
+        table(e.tracks, [
+          { label: '#', get: (r) => e.tracks.indexOf(r) + 1, num: true },
+          { label: 'Track', get: (r) => r.label },
+          { label: 'Score', get: (r) => r.score.toFixed(3), num: true },
+          { label: 'Votes', get: (r) => r.votes, num: true },
+          { label: 'Min dist', get: (r) => r.min_distance.toFixed(3), num: true },
+        ]));
+    }
+    if (out.landmark) {
+      const b = out.landmark;
+      html += section('Path B — landmarks',
+        getComputedStyle(document.documentElement).getPropertyValue('--path-b'),
+        `${b.n_query_hashes} query hashes &middot; extract ${b.extract_ms.toFixed(1)} ms &middot; search ${b.search_ms.toFixed(1)} ms`,
+        b.tracks.length ? table(b.tracks, [
+          { label: '#', get: (r) => b.tracks.indexOf(r) + 1, num: true },
+          { label: 'Track', get: (r) => r.label },
+          { label: 'Votes', get: (r) => r.votes, num: true },
+          { label: 'Offset in track', get: (r) => r.offset_seconds.toFixed(2) + ' s', num: true },
+        ]) : '<p class="meta">No aligned match found.</p>');
+    }
+    results.innerHTML = html;
+  } catch (err) {
+    statusEl.className = 'status err';
+    statusEl.textContent = 'Failed: ' + err.message;
+  } finally {
+    go.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
